@@ -77,13 +77,18 @@ flowchart TB
     Recollection --> EventBus
 
     EventBus["Kafka Event Backbone (MSK)"] --> S3["Raw Event Lake (S3/Parquet)"]
-    EventBus --> CH["Operational Analytics Store (ClickHouse)"]
+    S3 --> S3Q["ClickHouse S3Queue Ingestion"]
+    S3Q --> CH["Operational Analytics Store (ClickHouse)"]
 
     CH --> Semantic["Operational Semantic Layer"]
     Semantic --> Dashboards["Operational Dashboards"]
     Semantic --> RuleSegment["Rule + Segment + Workflow APIs"]
     Semantic --> Agents["Agent Orchestration Layer"]
 ```
+
+Primary ingestion path in this version:
+
+`Sources -> Kafka -> S3 (Parquet) -> ClickHouse S3Queue -> Raw -> MVs -> State/Aggregates`
 
 ## 5) Core architecture principles
 
@@ -147,6 +152,8 @@ Required controls:
   - Parquet + compression (snappy/zstd)
 - Purpose:
   - Long-term retention, replay, backfills, model training, and audit
+- Ingestion anchor:
+  - ClickHouse consumes production event files from S3 via `S3Queue`
 
 ### 7.3 ClickHouse analytical and operational serving layer
 
@@ -161,6 +168,7 @@ Recommended modeling pattern:
 - Keep raw events immutable in MergeTree tables
 - Use materialized views for incremental projections/aggregates
 - Use replacing/versioned state models for late-arriving and out-of-order updates
+- Consume from S3-ready prefixes through `S3Queue` for consistency with archived source
 
 Representative example (illustrative):
 
@@ -195,6 +203,12 @@ ENGINE = ReplacingMergeTree(state_version)
 PARTITION BY toYYYYMM(updated_at)
 ORDER BY (tenant_id, worker_id);
 ```
+
+### 7.4 Consistency model
+
+- S3-anchored path (`Kafka -> S3 -> S3Queue -> ClickHouse`) is the default for stronger store-to-store consistency.
+- Strict "always identical at all times" parity across stores is not guaranteed in distributed systems during transient failures; target bounded eventual consistency with freshness SLOs.
+- If optional fast-lane (`Kafka -> ClickHouse`) is enabled, require reconciliation jobs by tenant/time window and replay repair from S3.
 
 ## 8) Ontology and semantic layer
 
@@ -274,16 +288,16 @@ Guidelines:
 
 ## 13) Key architecture decisions with provenance
 
-### Decision A: Kafka + S3 + ClickHouse as the operational data plane
+### Decision A: Kafka + S3 + S3Queue + ClickHouse as the operational data plane
 
-- What: Use MSK for event transport, S3 for retention/replay, ClickHouse for serving state and aggregates.
-- Why: Decouples producers from consumers and preserves replayable history.
+- What: Use MSK for event transport, S3 as archival and ingestion anchor, and ClickHouse (via S3Queue) for serving state and aggregates.
+- Why: Preserves replayable history and ensures ClickHouse only processes files already committed to S3.
 - Category: derived
 - Confidence: high
 - Source:
-  - https://clickhouse.com/docs/en/integrations/kafka
+  - https://clickhouse.com/docs/engines/table-engines/integrations/s3queue
   - https://clickhouse.com/docs/best-practices
-  - AWS MSK/S3 standard architecture guidance
+  - AWS MSK/S3 pipeline guidance
 
 ### Decision B: State projections via incremental materialized views
 
@@ -304,6 +318,17 @@ Guidelines:
   - https://clickhouse.com/docs/en/guides/replacing-merge-tree
   - https://clickhouse.com/docs/best-practices
 
+
+### Decision D: Keep direct Kafka -> ClickHouse as optional low-latency fallback
+
+- What: Maintain optional direct Kafka ingestion path for selected low-latency use cases.
+- Why: Enables faster path for strict real-time workflows while S3-anchored mode remains default.
+- Category: field
+- Confidence: heuristic
+- Source:
+  - https://clickhouse.com/docs/en/integrations/kafka
+  - https://clickhouse.com/docs/engines/table-engines/integrations/s3queue
+
 ## 14) Open decisions
 
 1. ClickHouse deployment model:
@@ -319,4 +344,5 @@ Guidelines:
 - Worker state projection reaches target freshness SLO
 - Rule/segment/workflow loop produces measurable reduction in stalled onboarding and compliance delays
 - Agent actions are policy-gated, auditable, and reversible
+
 

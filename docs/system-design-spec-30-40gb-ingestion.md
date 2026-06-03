@@ -50,7 +50,7 @@ flowchart TB
     DLQ["Dead Letter Topics"]
     KafkaConnect["Kafka Connect"]
     S3Sink["S3 Sink Connector (Parquet)"]
-    CHIngest["ClickHouse Ingestion Service (Kafka Engine / ClickPipes)"]
+    S3Queue["ClickHouse S3Queue Consumer"]
   end
 
   %% -------------------------------
@@ -110,8 +110,9 @@ flowchart TB
   Topics --> KafkaConnect
   KafkaConnect --> S3Sink
   S3Sink --> S3Lake
-  Topics --> CHIngest
-  CHIngest --> CHRaw
+  S3Lake --> S3Queue
+  S3Queue --> CHRaw
+  Topics -.optional low-latency fast lane.-> CHRaw
   CHRaw --> CHMV
   CHMV --> CHState
   CHMV --> CHAgg
@@ -153,6 +154,23 @@ flowchart TB
 
 ## 3) System design specification for 30-40 GB/day
 
+## 3.0 Ingestion strategy decision
+
+Primary production path (consistency-first):
+
+`Sources -> Kafka -> S3 (Parquet) -> S3Queue -> ClickHouse Raw -> MVs -> State/Aggregates`
+
+Alternative fast path (optional):
+
+`Sources -> Kafka -> ClickHouse Raw`
+
+Use consistency-first path as default when parity between S3 archive and ClickHouse serving data is a priority.
+
+Trade-off summary:
+
+- **S3-anchored (default):** stronger S3/ClickHouse consistency and simpler replay, with higher latency.
+- **Parallel Kafka -> S3 and Kafka -> ClickHouse:** lower latency, but requires reconciliation to guarantee parity.
+
 ## 3.1 Kafka/MSK
 
 - **Cluster layout:** 3 brokers minimum across 3 AZs
@@ -173,9 +191,16 @@ Why this works at 30-40 GB/day:
 
 - **Sink format:** Parquet (snappy/zstd)
 - **Partitioning:** `tenant`, `year`, `month`, `day`
-- **Object sizing target:** 128-512 MB files for efficient scan and replay
+- **Object sizing target (sub-60s profile):** 8-32 MB files with time-based rolling
 - **Retention:** multi-year per compliance policy
 - **Lifecycle:** transition older partitions to colder storage classes
+
+Kafka -> S3 sink configuration baseline for sub-60s:
+
+- `rotate.interval.ms`: 10000-15000
+- `flush.size`: tuned to avoid waiting on record count at low throughput
+- write completed files into `ready/` prefixes for S3Queue consumption
+- Parquet + snappy (or zstd if CPU budget allows)
 
 Estimated annual raw data:
 
@@ -183,15 +208,16 @@ Estimated annual raw data:
 
 ## 3.3 ClickHouse serving layer
 
-- **Deployment:** ClickHouse Cloud preferred (or self-managed 2 shard x 2 replica baseline)
+- **Deployment:** Managed ClickHouse preferred (or self-managed 2 shard x 2 replica baseline)
 - **Data model layers:**
   1. raw immutable event tables
   2. state projection tables
   3. aggregate metrics tables
 - **Engine strategy:**
-  - Raw: `MergeTree`
-  - State: `ReplacingMergeTree(version)` for late-arriving updates
+  - Raw: `ReplicatedMergeTree`
+  - State: `ReplicatedReplacingMergeTree(version)` for late-arriving updates
   - Aggregates: incremental materialized views to precompute operational KPIs
+- **Ingestion path:** S3Queue source tables + MVs into replicated raw tables
 - **Partitioning baseline:** monthly by event time (`toYYYYMM(event_time)`)
 - **ORDER BY baseline:** `(tenant_id, entity_id, event_time, event_id)`
 
@@ -218,7 +244,7 @@ Capacity baseline:
 
 ## 4) Latency and reliability targets
 
-- Ingestion to ClickHouse raw availability: p95 under 20s
+- Ingestion to ClickHouse raw availability (S3Queue path): p95 under 45s
 - Ingestion to state projection: p95 under 60s
 - Semantic API p95 for common worker queries: under 1s
 - Workflow trigger success: 99%+
@@ -252,7 +278,7 @@ Promotion gates:
 
 1. Canonical event schema + schema registry + producer SDK
 2. MSK topics + DLQ + S3 sink
-3. ClickHouse raw + `worker_state` projection + daily aggregates
+3. S3Queue -> ClickHouse raw + `worker_state` projection + daily aggregates
 4. GraphQL semantic API for worker/compliance operational queries
 5. First rule pack:
    - workers stuck > 48h
@@ -271,12 +297,13 @@ This section defines the managed ClickHouse topology for both ingestion processi
 - Managed ClickHouse cluster
 - **2 shards x 2 replicas** minimum for production baseline
 - Dedicated role separation:
-  - **processing path:** Kafka ingestion + materialized view compute
+  - **processing path:** S3Queue ingestion + materialized view compute
   - **serving path:** GraphQL/semantic API reads from distributed serving tables
 
 ```mermaid
 flowchart LR
-  Kafka["MSK Kafka Topics"] --> Ingest["Ingestion Consumers"]
+  Kafka["MSK Kafka Topics"] --> S3["S3 Parquet Ready Prefix"]
+  S3 --> Ingest["S3Queue Consumers"]
 
   subgraph CH["Managed ClickHouse Cluster"]
     subgraph S1["Shard 1"]
@@ -320,6 +347,43 @@ Why:
 ### 8.3 Reference DDL pattern
 
 ```sql
+-- S3Queue source table
+CREATE TABLE worker_events_s3q ON CLUSTER firstwork_cluster
+(
+  tenant_id String,
+  worker_id String,
+  event_time DateTime64(3, 'UTC'),
+  event_type String,
+  event_id UUID,
+  event_version UInt16,
+  payload_json String
+)
+ENGINE = S3Queue(
+  'https://s3.amazonaws.com/firstwork-events/ready/tenant=*/year=*/month=*/day=*/*.parquet',
+  'Parquet'
+)
+SETTINGS
+  mode = 'ordered',
+  after_processing = 'keep',
+  s3queue_polling_min_timeout_ms = 1000,
+  s3queue_polling_max_timeout_ms = 2000,
+  s3queue_processing_threads_num = 4;
+
+-- MV from S3Queue to local raw events
+CREATE MATERIALIZED VIEW worker_events_s3q_mv ON CLUSTER firstwork_cluster
+TO worker_events_local
+AS
+SELECT
+  tenant_id,
+  worker_id,
+  event_time,
+  event_type,
+  event_id,
+  event_version,
+  payload_json,
+  now64() AS ingest_time
+FROM worker_events_s3q;
+
 -- Local raw events (on each replica)
 CREATE TABLE worker_events_local ON CLUSTER firstwork_cluster
 (
@@ -394,3 +458,29 @@ ENGINE = Distributed(
 - Per `schema-partition-low-cardinality` and `schema-partition-lifecycle`: use monthly partitions for lifecycle, not ad-hoc query acceleration.
 - Per `insert-mutation-avoid-update`: use replacing/versioned state patterns instead of frequent UPDATE mutations.
 - Per `query-mv-incremental`: build real-time aggregates through incremental materialized views.
+
+
+## 8.6 Sub-60s S3Queue tuning profile
+
+Use this baseline profile to keep state freshness under 60 seconds p95 at 30-40 GB/day:
+
+- Kafka -> S3 roll interval: 10-15 seconds
+- S3 file size target: 8-32 MB
+- S3Queue poll interval: 1-2 seconds
+- S3Queue processing threads: 4-8 per shard
+- Keep ingest MVs lightweight (avoid heavy joins in ingest path)
+
+Latency budget guideline:
+
+- file roll/finalize: 10-20s
+- S3Queue discovery: 1-3s
+- parse + raw insert: 5-15s
+- raw -> state MV update: 5-15s
+- total p95 target: 25-50s
+
+Must-have monitors:
+
+- oldest unprocessed S3 object age
+- S3Queue backlog and processing throughput
+- ingest-to-raw lag and ingest-to-state lag
+- duplicate `event_id` rate

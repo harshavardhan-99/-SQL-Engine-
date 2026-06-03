@@ -22,7 +22,9 @@ flowchart LR
   Sources["Operational Sources"] --> Connectors["Source Connectors"]
   Connectors --> Kafka["Kafka Event Backbone"]
   Kafka --> S3["S3 Event Lake"]
-  Kafka --> CH["ClickHouse Processing + Serving"]
+  S3 --> S3Queue["ClickHouse S3Queue Ingestion"]
+  S3Queue --> CH["ClickHouse Processing + Serving"]
+  Kafka -.optional fast lane.-> CH
   CH --> Semantic["Semantic Query API"]
   CH --> RuleSeg["Rule + Segment Engine"]
   RuleSeg --> Workflow["Workflow Orchestration"]

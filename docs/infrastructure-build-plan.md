@@ -23,6 +23,17 @@ Audience: Platform engineering, data engineering, SRE, security, product enginee
 - **Observability:** CloudWatch + OpenTelemetry pipeline + centralized logs/metrics/traces
 - **Secrets and keys:** AWS Secrets Manager + KMS
 
+### Ingestion mode decision (adopted)
+
+- **Default mode:** `Sources -> Kafka -> S3 -> S3Queue -> ClickHouse`
+- **Reason:** better S3/ClickHouse data consistency and simpler replay/backfill
+- **Optional fast lane:** `Sources -> Kafka -> ClickHouse` for selected low-latency workloads
+
+Trade-off summary:
+
+- S3-anchored mode: stronger consistency, higher latency
+- Parallel fan-out mode: lower latency, requires reconciliation jobs
+
 ## 2.2 Environment topology
 
 Use isolated environments with separate infra stacks:
@@ -100,6 +111,7 @@ Deliverables:
 - Partitioning by tenant/year/month/day
 - Lifecycle management and storage class transitions
 - Replay tooling from S3 into downstream systems
+- Sub-60s sink profile: `rotate.interval.ms=10000-15000`, object size target `8-32 MB`, ready-prefix write pattern
 
 Exit criteria:
 
@@ -110,7 +122,8 @@ Exit criteria:
 
 Deliverables:
 
-- Raw event tables
+- S3Queue source tables and ingestion MVs
+- Replicated raw event tables
 - Materialized views for state and aggregate projections
 - Query users/roles and row-level tenant isolation strategy
 - Backup and restore runbooks
@@ -222,6 +235,24 @@ Initial operational guardrails:
 - PII classification and retention policies mapped to legal requirements
 - Break-glass operational access with just-in-time approvals
 
+## 7.1 Sub-60s S3Queue configuration profile
+
+Recommended baseline at 30-40 GB/day:
+
+- Kafka -> S3 roll interval: 10-15s
+- S3 file size: 8-32 MB
+- S3Queue polling: 1-2s
+- S3Queue processing threads: 4-8 per shard
+- Keep ingest MV logic lightweight
+
+Latency budget target:
+
+- file roll/finalize: 10-20s
+- S3Queue discovery: 1-3s
+- parse + raw insert: 5-15s
+- raw -> state MV: 5-15s
+- total p95: 25-50s
+
 ## 8) Observability and SLOs
 
 Track:
@@ -260,7 +291,7 @@ Suggested SLOs:
 
 1. Finalize canonical event schema and producer SDK contracts
 2. Stand up `dev` MSK + S3 sink + sample producer/consumer
-3. Implement first ClickHouse raw + worker_state projection pipeline
+3. Implement first S3Queue -> ClickHouse raw + worker_state projection pipeline
 4. Expose first GraphQL worker query from semantic API
 5. Implement first rules:
    - workers stuck > 48 hours

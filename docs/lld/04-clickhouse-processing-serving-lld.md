@@ -6,7 +6,7 @@ Process raw events into operational state and serve low-latency analytical/opera
 
 ## Responsibilities
 
-- Consume Kafka events into raw replicated tables
+- Consume S3-ready Parquet objects through S3Queue into raw replicated tables
 - Build incremental state and aggregate projections
 - Serve distributed query endpoints for semantic API and dashboards
 - Handle late-arriving events using versioned state models
@@ -28,16 +28,18 @@ Process raw events into operational state and serve low-latency analytical/opera
 
 ## Data flow
 
-1. Kafka consumers write canonical events into raw local tables.
-2. Materialized views project state and aggregate tables incrementally.
-3. Semantic API reads distributed serving tables (`*_all`).
-4. Rule engine reads state projections for action decisions.
+1. S3Queue source tables discover new S3-ready objects.
+2. Ingestion MVs insert canonical events into raw local replicated tables.
+3. Materialized views project state and aggregate tables incrementally.
+4. Semantic API reads distributed serving tables (`*_all`).
+5. Rule engine reads state projections for action decisions.
 
 ## Mermaid
 
 ```mermaid
 flowchart LR
-  Kafka["Kafka Topics"] --> Ingest["CH Ingest Consumers"]
+  S3["S3 Ready Prefix"] --> S3Q["S3Queue Source Tables"]
+  S3Q --> IngestMV["Ingestion Materialized Views"]
 
   subgraph CH["Managed ClickHouse Cluster"]
     Raw["ReplicatedMergeTree Raw Tables"]
@@ -47,7 +49,7 @@ flowchart LR
     Dist["Distributed Serving Tables"]
   end
 
-  Ingest --> Raw
+  IngestMV --> Raw
   Raw --> MV
   MV --> State
   MV --> Agg
@@ -64,3 +66,12 @@ flowchart LR
 - Automated backups + restore drills
 - Throttled replay from S3 for backfill safety
 
+
+
+## S3Queue configuration baseline
+
+- `mode = ordered`
+- `after_processing = keep` during stabilization
+- `s3queue_polling_min_timeout_ms = 1000`
+- `s3queue_polling_max_timeout_ms = 2000`
+- `s3queue_processing_threads_num = 4` (increase to 8 per shard as needed)
