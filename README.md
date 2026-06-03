@@ -40,3 +40,8 @@ python sqlEngine.py “<query>”
 * ```Select col1, col2 from table1,table2 where table1.col1=table2.col2;```
 
 The details about the implementation can be found in this [pdf](https://github.com/nonejk/Mini-SQL-Engine/blob/master/details.pdf).
+
+## Additional documentation
+
+- [Firstwork Operational Intelligence Platform Architecture](docs/operational-intelligence-platform-architecture.md)
+- [Firstwork Infrastructure Build Plan](docs/infrastructure-build-plan.md)
