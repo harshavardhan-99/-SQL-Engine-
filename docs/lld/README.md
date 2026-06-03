@@ -14,6 +14,7 @@ This directory contains low-level design documents for each major component in t
 8. `08-workflow-orchestration-lld.md`
 9. `09-agent-automation-lld.md`
 10. `10-observability-security-governance-lld.md`
+11. `11-ingestion-reliability-control-plane-lld.md`
 
 ## End-to-end data flow map
 
@@ -21,22 +22,27 @@ This directory contains low-level design documents for each major component in t
 flowchart LR
   Sources["Operational Sources"] --> Connectors["Source Connectors"]
   Connectors --> Kafka["Kafka Event Backbone"]
+  Kafka --> CH["ClickHouse Processing + Serving"]
   Kafka --> S3["S3 Event Lake"]
-  S3 --> S3Queue["ClickHouse S3Queue Ingestion"]
-  S3Queue --> CH["ClickHouse Processing + Serving"]
-  Kafka -.optional fast lane.-> CH
+  Kafka --> Reliability["Ingestion Reliability Control Plane"]
+  Reliability --> CH
+  Reliability --> S3
+  S3 --> Replay["Replay Service"]
+  Replay --> CH
+
   CH --> Semantic["Semantic Query API"]
   CH --> RuleSeg["Rule + Segment Engine"]
   RuleSeg --> Workflow["Workflow Orchestration"]
   Workflow --> Agents["Agent Automation Layer"]
+
   Metadata["Metadata Registry"] --> Semantic
   Metadata --> RuleSeg
   Metadata --> Workflow
+
   ObsSec["Observability + Security + Governance"] -.controls.-> Connectors
   ObsSec -.controls.-> Kafka
   ObsSec -.controls.-> CH
-  ObsSec -.controls.-> Semantic
+  ObsSec -.controls.-> Reliability
   ObsSec -.controls.-> Workflow
   ObsSec -.controls.-> Agents
 ```
-

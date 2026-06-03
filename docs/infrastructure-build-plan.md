@@ -25,14 +25,15 @@ Audience: Platform engineering, data engineering, SRE, security, product enginee
 
 ### Ingestion mode decision (adopted)
 
-- **Default mode:** `Sources -> Kafka -> S3 -> S3Queue -> ClickHouse`
-- **Reason:** better S3/ClickHouse data consistency and simpler replay/backfill
-- **Optional fast lane:** `Sources -> Kafka -> ClickHouse` for selected low-latency workloads
+- **Default mode:** `Sources -> Kafka -> (parallel) ClickHouse + S3`
+- **Reason:** best balance of low-latency operations, resilience, and replayability
+- **Robustness requirement:** reliability control plane with idempotency, checkpoints, reconciliation, and replay
+- **Optional compliance mode:** `Sources -> Kafka -> S3 -> ClickHouse` for archive-first workflows
 
 Trade-off summary:
 
-- S3-anchored mode: stronger consistency, higher latency
-- Parallel fan-out mode: lower latency, requires reconciliation jobs
+- Parallel mode: lower latency and better decoupling, requires reconciliation controls
+- S3-anchored mode: simpler archive-serving parity, higher latency and higher S3 listing sensitivity
 
 ## 2.2 Environment topology
 
@@ -57,6 +58,7 @@ infra/
     msk/
     s3-event-lake/
     clickhouse/
+    ingestion-control-plane/
     dynamodb-registry/
     semantic-api/
     observability/
@@ -103,26 +105,39 @@ Exit criteria:
 - At least 2 source systems publishing canonical events
 - Consumer lag dashboards and alerting active
 
-## Phase 2 - S3 raw event lake
+## Phase 2 - Dual sink ingestion
 
 Deliverables:
 
-- Kafka-to-S3 sink in Parquet
-- Partitioning by tenant/year/month/day
+- Kafka->ClickHouse ingestion path (Kafka engine or ClickPipes)
+- Kafka->S3 sink in Parquet
+- S3 partitioning by tenant/year/month/day
 - Lifecycle management and storage class transitions
-- Replay tooling from S3 into downstream systems
-- Sub-60s sink profile: `rotate.interval.ms=10000-15000`, object size target `8-32 MB`, ready-prefix write pattern
 
 Exit criteria:
 
-- End-to-end event replay works for selected tenant/date slices
+- End-to-end events visible in ClickHouse and S3 for same tenant/time windows
 - Data quality checks (row counts, schema drift, freshness) active
 
-## Phase 3 - ClickHouse core serving layer
+## Phase 3 - Ingestion reliability control plane
 
 Deliverables:
 
-- S3Queue source tables and ingestion MVs
+- Idempotency contract (`event_id`) and de-dup strategy
+- Checkpoint store for each ingestion stage (DynamoDB/ClickHouse control tables)
+- Reconciliation jobs (`Kafka vs S3 vs ClickHouse`) by tenant/time bucket
+- Replay service (Kafka/S3 -> ClickHouse)
+- Quarantine and DLQ routing workflows
+
+Exit criteria:
+
+- Automated repair for selected failure scenarios validated
+- Replay and reconciliation runbooks executed in stage
+
+## Phase 4 - ClickHouse core serving layer
+
+Deliverables:
+
 - Replicated raw event tables
 - Materialized views for state and aggregate projections
 - Query users/roles and row-level tenant isolation strategy
@@ -140,7 +155,7 @@ Exit criteria:
 - p95 state query under defined threshold on stage-like data volume
 - Projection freshness SLA tracked and alertable
 
-## Phase 4 - Semantic and operational API layer
+## Phase 5 - Semantic and operational API layer
 
 Deliverables:
 
@@ -154,7 +169,7 @@ Exit criteria:
 - Core worker/compliance queries stable for product integration
 - API-level audit logs linked to query executions
 
-## Phase 5 - Rule, segment, and workflow activation
+## Phase 6 - Rule, segment, and workflow activation
 
 Deliverables:
 
@@ -168,7 +183,7 @@ Exit criteria:
 - At least 3 production-like rules functioning end-to-end
 - Trigger-to-action latency and success metrics available
 
-## Phase 6 - Agent action plane (controlled rollout)
+## Phase 7 - Agent action plane (controlled rollout)
 
 Deliverables:
 
@@ -235,23 +250,22 @@ Initial operational guardrails:
 - PII classification and retention policies mapped to legal requirements
 - Break-glass operational access with just-in-time approvals
 
-## 7.1 Sub-60s S3Queue configuration profile
+## 7.1 Reliability configuration profile (parallel + robust DLQ)
 
 Recommended baseline at 30-40 GB/day:
 
-- Kafka -> S3 roll interval: 10-15s
-- S3 file size: 8-32 MB
-- S3Queue polling: 1-2s
-- S3Queue processing threads: 4-8 per shard
-- Keep ingest MV logic lightweight
+- Producer settings: `acks=all`, idempotent producers enabled
+- Partitioning key: `tenant_id + entity_id`
+- DLQ classes: validation errors, parse errors, transformation errors, sink errors
+- Checkpoint commit interval: 5-15s
+- Reconciliation cadence: every 5-15 minutes by tenant/time window
+- Replay trigger: automatic on mismatch thresholds and manual on demand
 
-Latency budget target:
+Repair and correctness profile:
 
-- file roll/finalize: 10-20s
-- S3Queue discovery: 1-3s
-- parse + raw insert: 5-15s
-- raw -> state MV: 5-15s
-- total p95: 25-50s
+- Idempotent replays by immutable `event_id`
+- Quarantine prefixes/topics for poison payloads
+- Retry with capped exponential backoff for transient failures
 
 ## 8) Observability and SLOs
 
@@ -261,6 +275,7 @@ Track:
 - S3 sink success and partition completeness
 - ClickHouse insert errors, merge pressure, query latency
 - Projection freshness and state staleness
+- Reconciliation mismatch rate and replay queue depth
 - Rule evaluation latency and action execution success
 
 Suggested SLOs:
@@ -284,25 +299,29 @@ Suggested SLOs:
 4. **Automation safety incidents**  
    Mitigation: policy gates, dry-run mode, human approval for high-impact actions.
 
-5. **Cost growth from retention and ad hoc queries**  
+5. **Data divergence across sinks in parallel mode**  
+   Mitigation: scheduled reconciliation, mismatch alerts, and auto replay/repair.
+
+6. **Cost growth from retention and ad hoc queries**  
    Mitigation: lifecycle tiering, query governance, aggregate table strategy.
 
 ## 10) Immediate execution backlog
 
 1. Finalize canonical event schema and producer SDK contracts
-2. Stand up `dev` MSK + S3 sink + sample producer/consumer
-3. Implement first S3Queue -> ClickHouse raw + worker_state projection pipeline
-4. Expose first GraphQL worker query from semantic API
-5. Implement first rules:
+2. Stand up `dev` MSK + dual sinks (ClickHouse and S3)
+3. Implement first reliability controls (checkpoints, reconciliation, replay)
+4. Implement first ClickHouse raw + worker_state projection pipeline
+5. Expose first GraphQL worker query from semantic API
+6. Implement first rules:
    - workers stuck > 48 hours
    - expiring license in 30 days
-6. Wire workflow actions and full audit logging
+7. Wire workflow actions and full audit logging
 
 ## 11) Definition of done for MVP infrastructure
 
 - Events from ATS + onboarding + verification flowing end-to-end
 - Worker state projection available and trusted
 - Rule-to-workflow loop actively executing with observability
-- Replay from S3 proven in non-production and documented
+- Replay from Kafka/S3 proven in non-production and documented
+- Reconciliation and mismatch-repair cycle validated
 - Security review and operational runbooks complete
-

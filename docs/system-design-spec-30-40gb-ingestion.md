@@ -1,7 +1,7 @@
 # Firstwork Operational Intelligence Platform
 # Infrastructure + System Design Spec for 30-40 GB Ingestion
 
-Status: Draft v1  
+Status: Draft v2  
 Scope: Production design target for 30-40 GB/day event ingestion  
 Primary objective: Serve operational state and automation with replay-safe architecture
 
@@ -23,9 +23,6 @@ If event size is larger, multiply partition and consumer capacity proportionally
 
 ```mermaid
 flowchart TB
-  %% -------------------------------
-  %% Source systems
-  %% -------------------------------
   subgraph Sources["Operational Product Sources"]
     ATS["ATS"]
     Outreach["Worker Outreach"]
@@ -38,9 +35,6 @@ flowchart TB
     External["HRIS / CRM / External Compliance APIs"]
   end
 
-  %% -------------------------------
-  %% Ingestion and streaming layer
-  %% -------------------------------
   subgraph Ingestion["Ingestion + Streaming Plane (AWS)"]
     Debezium["Debezium CDC Connectors"]
     EventSDK["Event Producer SDK + Contract Tests"]
@@ -48,47 +42,43 @@ flowchart TB
     MSK["AWS MSK Kafka Cluster"]
     Topics["Kafka Topics (tenant/entity/event_type)"]
     DLQ["Dead Letter Topics"]
-    KafkaConnect["Kafka Connect"]
     S3Sink["S3 Sink Connector (Parquet)"]
-    S3Queue["ClickHouse S3Queue Consumer"]
+    CHIngest["ClickHouse Ingestion (Kafka Engine / ClickPipes)"]
   end
 
-  %% -------------------------------
-  %% Storage and compute
-  %% -------------------------------
   subgraph DataPlatform["Operational Data Platform"]
-    S3Lake["S3 Raw Event Lake\npartition: tenant/year/month/day"]
+    S3Lake["S3 Raw Event Lake
+partition: tenant/year/month/day"]
     CHRaw["ClickHouse Raw Event Tables"]
     CHMV["Materialized Views (incremental)"]
-    CHState["State Tables\nworker_state/document_state/compliance_state"]
-    CHAgg["Aggregate Tables\ndaily metrics / funnel metrics"]
+    CHState["State Tables
+worker_state/document_state/compliance_state"]
+    CHAgg["Aggregate Tables
+daily metrics / funnel metrics"]
     Backfill["Replay + Backfill Jobs"]
+    Reconcile["Reconciliation Jobs"]
   end
 
-  %% -------------------------------
-  %% Metadata and serving
-  %% -------------------------------
   subgraph Intelligence["Metadata + Semantic + Automation Layer"]
-    Dynamo["DynamoDB Metadata Registry\nentities, metrics, rules, segments, workflows, agents"]
+    Dynamo["DynamoDB Metadata Registry
+entities, metrics, rules, segments, workflows, agents"]
     GraphQL["GraphQL API"]
-    Compiler["Semantic Compiler\nGraphQL AST -> Semantic AST -> SQL"]
+    Compiler["Semantic Compiler
+GraphQL AST -> Semantic AST -> SQL"]
     RuleEngine["Rule Engine"]
     SegmentEngine["Segment Engine"]
     WorkflowEngine["Workflow Trigger Engine"]
     Agents["Agent Orchestration"]
     Dashboards["Operational Dashboards"]
-    NLQ["Natural Language Query Interface"]
   end
 
-  %% -------------------------------
-  %% Observability and security
-  %% -------------------------------
   subgraph Ops["Reliability, Security, Governance"]
+    Checkpoints["Checkpoint Store"]
+    ReplaySvc["Replay Service"]
     OTel["OpenTelemetry Collectors"]
     CW["CloudWatch Metrics + Logs + Alerts"]
     IAM["IAM + RBAC + Tenant Policies"]
     KMS["KMS + Secrets Manager + TLS"]
-    DQ["Data Quality Monitors\nschema drift, freshness, null rates"]
     Audit["Audit Trail + Action Logs"]
   end
 
@@ -107,17 +97,24 @@ flowchart TB
   EventSDK --> MSK
   MSK --> Topics
   Topics --> DLQ
-  Topics --> KafkaConnect
-  KafkaConnect --> S3Sink
+  Topics --> S3Sink
+  Topics --> CHIngest
   S3Sink --> S3Lake
-  S3Lake --> S3Queue
-  S3Queue --> CHRaw
-  Topics -.optional low-latency fast lane.-> CHRaw
+  CHIngest --> CHRaw
   CHRaw --> CHMV
   CHMV --> CHState
   CHMV --> CHAgg
+
   S3Lake --> Backfill
-  Backfill --> CHRaw
+  Backfill --> ReplaySvc
+  ReplaySvc --> CHRaw
+  Topics --> Reconcile
+  S3Lake --> Reconcile
+  CHRaw --> Reconcile
+
+  Checkpoints --> CHIngest
+  Checkpoints --> S3Sink
+  Checkpoints --> ReplaySvc
 
   Dynamo --> GraphQL
   Dynamo --> RuleEngine
@@ -132,22 +129,14 @@ flowchart TB
 
   CHAgg --> Dashboards
   CHState --> Dashboards
-  GraphQL --> NLQ
 
   OTel --> CW
-  MSK --> OTel
-  CHRaw --> OTel
-  GraphQL --> OTel
-  RuleEngine --> OTel
-
   IAM --> MSK
   IAM --> GraphQL
   IAM --> CHState
   KMS --> MSK
   KMS --> S3Lake
   KMS --> CHRaw
-  DQ --> Topics
-  DQ --> CHState
   WorkflowEngine --> Audit
   Agents --> Audit
 ```
@@ -156,20 +145,22 @@ flowchart TB
 
 ## 3.0 Ingestion strategy decision
 
-Primary production path (consistency-first):
+Primary production path (recommended):
 
-`Sources -> Kafka -> S3 (Parquet) -> S3Queue -> ClickHouse Raw -> MVs -> State/Aggregates`
+`Sources -> Kafka -> (parallel) ClickHouse + S3`
 
-Alternative fast path (optional):
+Reliability control plane (required):
 
-`Sources -> Kafka -> ClickHouse Raw`
+- immutable `event_id`
+- checkpoint tracking per stage
+- DLQ and quarantine
+- reconciliation and replay automation
 
-Use consistency-first path as default when parity between S3 archive and ClickHouse serving data is a priority.
+Alternative compliance path (optional):
 
-Trade-off summary:
+`Sources -> Kafka -> S3 -> ClickHouse`
 
-- **S3-anchored (default):** stronger S3/ClickHouse consistency and simpler replay, with higher latency.
-- **Parallel Kafka -> S3 and Kafka -> ClickHouse:** lower latency, but requires reconciliation to guarantee parity.
+Use parallel mode when operational latency matters; enforce correctness with reconciliation and replay.
 
 ## 3.1 Kafka/MSK
 
@@ -191,16 +182,15 @@ Why this works at 30-40 GB/day:
 
 - **Sink format:** Parquet (snappy/zstd)
 - **Partitioning:** `tenant`, `year`, `month`, `day`
-- **Object sizing target (sub-60s profile):** 8-32 MB files with time-based rolling
+- **Object sizing target:** 32-128 MB files for efficient request economics
 - **Retention:** multi-year per compliance policy
 - **Lifecycle:** transition older partitions to colder storage classes
 
-Kafka -> S3 sink configuration baseline for sub-60s:
+Kafka -> S3 sink baseline:
 
-- `rotate.interval.ms`: 10000-15000
-- `flush.size`: tuned to avoid waiting on record count at low throughput
-- write completed files into `ready/` prefixes for S3Queue consumption
-- Parquet + snappy (or zstd if CPU budget allows)
+- `rotate.interval.ms`: 30000-120000
+- `flush.size`: tuned to avoid tiny files under low throughput
+- monotonic partition prefixes for efficient replay scans
 
 Estimated annual raw data:
 
@@ -217,7 +207,7 @@ Estimated annual raw data:
   - Raw: `ReplicatedMergeTree`
   - State: `ReplicatedReplacingMergeTree(version)` for late-arriving updates
   - Aggregates: incremental materialized views to precompute operational KPIs
-- **Ingestion path:** S3Queue source tables + MVs into replicated raw tables
+- **Ingestion path:** Kafka engine/ClickPipes into replicated raw tables
 - **Partitioning baseline:** monthly by event time (`toYYYYMM(event_time)`)
 - **ORDER BY baseline:** `(tenant_id, entity_id, event_time, event_id)`
 
@@ -244,7 +234,7 @@ Capacity baseline:
 
 ## 4) Latency and reliability targets
 
-- Ingestion to ClickHouse raw availability (S3Queue path): p95 under 45s
+- Ingestion to ClickHouse raw availability (parallel path): p95 under 20s
 - Ingestion to state projection: p95 under 60s
 - Semantic API p95 for common worker queries: under 1s
 - Workflow trigger success: 99%+
@@ -271,22 +261,23 @@ Promotion gates:
 
 1. Event contract compatibility checks pass
 2. Projection freshness and query SLO pass in stage
-3. Rule action idempotency and rollback tests pass
-4. Security and audit controls verified
+3. Reconciliation and replay tests pass
+4. Rule action idempotency and rollback tests pass
+5. Security and audit controls verified
 
 ## 7) Minimal MVP build order for this scale
 
 1. Canonical event schema + schema registry + producer SDK
-2. MSK topics + DLQ + S3 sink
-3. S3Queue -> ClickHouse raw + `worker_state` projection + daily aggregates
-4. GraphQL semantic API for worker/compliance operational queries
-5. First rule pack:
+2. MSK topics + DLQ + dual sinks (S3 and ClickHouse)
+3. Implement checkpoints + reconciliation + replay services
+4. ClickHouse `worker_state` projection + daily aggregates
+5. GraphQL semantic API for worker/compliance operational queries
+6. First rule pack:
    - workers stuck > 48h
    - expiring credential in 30 days
-6. Workflow trigger + audited action logging
+7. Workflow trigger + audited action logging
 
-This is sufficient to deliver operational intelligence and automation for 30-40 GB/day while preserving replayability and future AI readiness.
-
+This is sufficient to deliver operational intelligence and automation for 30-40 GB/day while preserving replayability and robust failure recovery.
 
 ## 8) Managed ClickHouse processing + serving design (replicated MergeTree)
 
@@ -297,13 +288,13 @@ This section defines the managed ClickHouse topology for both ingestion processi
 - Managed ClickHouse cluster
 - **2 shards x 2 replicas** minimum for production baseline
 - Dedicated role separation:
-  - **processing path:** S3Queue ingestion + materialized view compute
+  - **processing path:** Kafka ingestion + materialized view compute
   - **serving path:** GraphQL/semantic API reads from distributed serving tables
 
 ```mermaid
 flowchart LR
-  Kafka["MSK Kafka Topics"] --> S3["S3 Parquet Ready Prefix"]
-  S3 --> Ingest["S3Queue Consumers"]
+  Kafka["MSK Kafka Topics"] --> Ingest["Ingestion Consumers"]
+  Kafka --> Lake["S3 Event Lake"]
 
   subgraph CH["Managed ClickHouse Cluster"]
     subgraph S1["Shard 1"]
@@ -322,6 +313,10 @@ flowchart LR
 
   Ingest --> S1R1
   Ingest --> S2R1
+  Lake --> Replay["Replay Loader"]
+  Replay --> S1R1
+  Replay --> S2R1
+
   S1R1 --> DistRaw
   S2R1 --> DistRaw
   DistRaw --> DistState
@@ -347,8 +342,8 @@ Why:
 ### 8.3 Reference DDL pattern
 
 ```sql
--- S3Queue source table
-CREATE TABLE worker_events_s3q ON CLUSTER firstwork_cluster
+-- Kafka source table
+CREATE TABLE worker_events_kafka ON CLUSTER firstwork_cluster
 (
   tenant_id String,
   worker_id String,
@@ -358,31 +353,16 @@ CREATE TABLE worker_events_s3q ON CLUSTER firstwork_cluster
   event_version UInt16,
   payload_json String
 )
-ENGINE = S3Queue(
-  'https://s3.amazonaws.com/firstwork-events/ready/tenant=*/year=*/month=*/day=*/*.parquet',
-  'Parquet'
+ENGINE = Kafka(
+  'kafka-broker:9092',
+  'worker-events',
+  'ch-worker-events-group',
+  'JSONEachRow'
 )
 SETTINGS
-  mode = 'ordered',
-  after_processing = 'keep',
-  s3queue_polling_min_timeout_ms = 1000,
-  s3queue_polling_max_timeout_ms = 2000,
-  s3queue_processing_threads_num = 4;
-
--- MV from S3Queue to local raw events
-CREATE MATERIALIZED VIEW worker_events_s3q_mv ON CLUSTER firstwork_cluster
-TO worker_events_local
-AS
-SELECT
-  tenant_id,
-  worker_id,
-  event_time,
-  event_type,
-  event_id,
-  event_version,
-  payload_json,
-  now64() AS ingest_time
-FROM worker_events_s3q;
+  kafka_num_consumers = 4,
+  kafka_thread_per_consumer = 1,
+  kafka_handle_error_mode = 'stream';
 
 -- Local raw events (on each replica)
 CREATE TABLE worker_events_local ON CLUSTER firstwork_cluster
@@ -402,6 +382,21 @@ ENGINE = ReplicatedMergeTree(
 )
 PARTITION BY toYYYYMM(event_time)
 ORDER BY (tenant_id, worker_id, event_time, event_id);
+
+-- MV from Kafka to local raw events
+CREATE MATERIALIZED VIEW worker_events_kafka_mv ON CLUSTER firstwork_cluster
+TO worker_events_local
+AS
+SELECT
+  tenant_id,
+  worker_id,
+  event_time,
+  event_type,
+  event_id,
+  event_version,
+  payload_json,
+  now64() AS ingest_time
+FROM worker_events_kafka;
 
 -- Global serving table across shards
 CREATE TABLE worker_events_all ON CLUSTER firstwork_cluster AS worker_events_local
@@ -459,28 +454,28 @@ ENGINE = Distributed(
 - Per `insert-mutation-avoid-update`: use replacing/versioned state patterns instead of frequent UPDATE mutations.
 - Per `query-mv-incremental`: build real-time aggregates through incremental materialized views.
 
+## 8.6 Parallel-path reliability profile
 
-## 8.6 Sub-60s S3Queue tuning profile
+Use this baseline profile to keep ingestion robust and state freshness under 60 seconds p95:
 
-Use this baseline profile to keep state freshness under 60 seconds p95 at 30-40 GB/day:
-
-- Kafka -> S3 roll interval: 10-15 seconds
-- S3 file size target: 8-32 MB
-- S3Queue poll interval: 1-2 seconds
-- S3Queue processing threads: 4-8 per shard
+- Producer: idempotent + `acks=all`
+- Kafka consumer parallelism: match topic partitions
+- Checkpoint commit interval: 5-15s
+- Reconciliation interval: 5-15m per tenant/time bucket
+- Replay trigger on mismatch thresholds
 - Keep ingest MVs lightweight (avoid heavy joins in ingest path)
 
 Latency budget guideline:
 
-- file roll/finalize: 10-20s
-- S3Queue discovery: 1-3s
-- parse + raw insert: 5-15s
+- Kafka consume + parse: 2-8s
+- raw insert: 2-10s
 - raw -> state MV update: 5-15s
-- total p95 target: 25-50s
+- total p95 target: 15-45s
 
 Must-have monitors:
 
-- oldest unprocessed S3 object age
-- S3Queue backlog and processing throughput
+- Kafka consumer lag per partition
 - ingest-to-raw lag and ingest-to-state lag
+- DLQ rate by error class
+- reconciliation mismatch rate
 - duplicate `event_id` rate

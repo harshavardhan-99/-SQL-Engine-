@@ -7,7 +7,6 @@ Store immutable historical event data for replay, audit, backfill, and AI/ML tra
 ## Responsibilities
 
 - Persist Kafka stream into partitioned Parquet
-- Expose `ready/` prefixes as ingestion source for ClickHouse S3Queue
 - Retain long-term immutable history
 - Support replay jobs into ClickHouse and downstream systems
 - Provide audit export and lineage compatibility
@@ -21,10 +20,10 @@ Store immutable historical event data for replay, audit, backfill, and AI/ML tra
 
 ## Data flow
 
-1. Kafka sink batches and writes events as Parquet objects into ready prefixes.
-2. S3Queue discovers new ready files and streams them into ClickHouse raw tables.
-3. Data quality checks verify partition completeness.
-4. Replay jobs read selected partitions by tenant/date when repair is needed.
+1. Kafka sink batches and writes events as Parquet objects.
+2. Reconciliation jobs compare S3 counts/checksums with Kafka and ClickHouse.
+3. Replay jobs read selected partitions by tenant/date.
+4. Replay writes back into ClickHouse raw ingest pipeline.
 
 ## Mermaid
 
@@ -33,9 +32,11 @@ flowchart LR
   Kafka["Kafka Topics"] --> Sink["Kafka->S3 Sink"]
   Sink --> Partitioned["Partitioned Parquet Objects"]
   Partitioned --> S3["S3 Raw Event Lake"]
-  S3 --> S3Q["ClickHouse S3Queue"]
-  S3Q --> CHRaw["ClickHouse Raw Event Tables"]
-  S3 --> DQ["Partition Completeness + Schema Drift Checks"]
+
+  Kafka --> Reconcile["Reconciliation Jobs"]
+  S3 --> Reconcile
+  CHRaw["ClickHouse Raw Event Tables"] --> Reconcile
+
   S3 --> Replay["Replay/Backfill Jobs"]
   Replay --> CHRaw
   S3 --> ML["Feature/Model Pipelines"]
@@ -46,11 +47,8 @@ flowchart LR
 - If ClickHouse ingestion fails, replay affected tenant/date range from S3
 - Keep replay idempotent using `event_id` de-duplication logic downstream
 
+## Cost-efficient write profile
 
-
-## Sub-60s write profile
-
-- Sink roll interval: 10-15 seconds
-- Object size target: 8-32 MB
-- Publish only completed files into ready prefixes
-- Keep file naming monotonic for ordered S3Queue processing
+- Sink roll interval: 30-120 seconds (tune by latency requirements)
+- Object size target: 32-128 MB for balanced request cost and replay speed
+- Keep partition prefixes bounded by tenant/time for efficient scans

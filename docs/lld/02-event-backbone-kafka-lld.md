@@ -8,9 +8,9 @@ Provide durable, ordered, replayable event transport between producers and downs
 
 - Topic management and partitioning
 - Producer/consumer decoupling
-- Replay window retention
-- S3 anchoring for consistency-first processing
+- Fan-out to real-time serving and archival sinks
 - DLQ routing for invalid or unprocessable messages
+- Offset/checkpoint telemetry for ingestion control plane
 
 ## Topic and partition design
 
@@ -23,27 +23,28 @@ Provide durable, ordered, replayable event transport between producers and downs
 
 1. Source connectors publish canonical events.
 2. Kafka stores ordered event log by partition.
-3. Primary sink writes Kafka events to S3-ready prefixes.
-4. ClickHouse consumes from S3 via S3Queue for raw table ingest.
-5. Optional direct Kafka -> ClickHouse path can be enabled for low-latency endpoints.
-6. Failed consumption is routed to consumer DLQ topics.
+3. Parallel consumers read for:
+   - ClickHouse raw ingest (real-time)
+   - S3 archival sink
+4. Reliability services consume offsets/metrics for checkpointing and reconciliation.
+5. Failed consumption is routed to consumer DLQ topics.
 
 ## Mermaid
 
 ```mermaid
 flowchart TB
   Producers["Source Connectors"] --> Topics["Kafka Topics"]
+  Topics --> CHIngest["ClickHouse Ingest Consumer"]
   Topics --> S3Sink["S3 Sink Consumer"]
-  Topics --> StreamRules["Streaming Rule Preprocessor (optional)"]
+  Topics --> Ctrl["Checkpoint + Reconciliation Workers"]
 
-  S3Sink --> S3["S3 Event Lake (ready prefix)"]
-  S3 --> S3Q["ClickHouse S3Queue"]
-  S3Q --> CHRaw["ClickHouse Raw Events"]
-  Topics -.optional fast lane.-> CHRaw
-  StreamRules --> RuleQueue["Rule Trigger Queue"]
+  CHIngest --> CHRaw["ClickHouse Raw Events"]
+  S3Sink --> S3["S3 Event Lake"]
+  Ctrl --> Reconcile["Mismatch Detector"]
+  Reconcile --> Replay["Replay Trigger"]
 
-  S3Sink --> DLQ["Consumer DLQ Topics"]
-  S3Q --> DLQ
+  CHIngest --> DLQ["Consumer DLQ Topics"]
+  S3Sink --> DLQ
 ```
 
 ## Operational controls
@@ -51,12 +52,11 @@ flowchart TB
 - Producer idempotence + `acks=all`
 - Consumer lag alert thresholds by topic and tenant
 - Dead-letter monitoring and replay tooling
-
-
+- Per-stage checkpoint updates every 5-15 seconds
 
 ## Configuration baseline (sub-60s target)
 
-- Kafka -> S3 `rotate.interval.ms`: 10-15s
-- target object size: 8-32 MB
-- S3Queue polling: 1-2s
-- S3Queue threads: 4-8 per shard
+- Kafka partitions: 24-36 for high-volume domains
+- CH consumers: match partition count over nodes/shards
+- DLQ retry policy: exponential backoff + max retry cap
+- Reconciliation cadence: every 5-15 minutes

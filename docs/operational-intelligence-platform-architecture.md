@@ -2,7 +2,7 @@
 
 Author: Harsha Gudupudi  
 Document type: System design and architecture specification  
-Status: Draft v1
+Status: Draft v3
 
 ## 1) Objective
 
@@ -76,9 +76,15 @@ flowchart TB
     Browser --> EventBus
     Recollection --> EventBus
 
-    EventBus["Kafka Event Backbone (MSK)"] --> S3["Raw Event Lake (S3/Parquet)"]
-    S3 --> S3Q["ClickHouse S3Queue Ingestion"]
-    S3Q --> CH["Operational Analytics Store (ClickHouse)"]
+    EventBus["Kafka Event Backbone (MSK)"] --> CHIngest["ClickHouse Ingestion (Kafka Engine / ClickPipes)"]
+    EventBus --> S3["Raw Event Lake (S3/Parquet)"]
+    CHIngest --> CH["Operational Analytics Store (ClickHouse)"]
+
+    EventBus --> Ctrl["Ingestion Reliability Control Plane"]
+    Ctrl --> S3
+    Ctrl --> CH
+    S3 --> Replay["Replay + Backfill Service"]
+    Replay --> CH
 
     CH --> Semantic["Operational Semantic Layer"]
     Semantic --> Dashboards["Operational Dashboards"]
@@ -88,7 +94,11 @@ flowchart TB
 
 Primary ingestion path in this version:
 
-`Sources -> Kafka -> S3 (Parquet) -> ClickHouse S3Queue -> Raw -> MVs -> State/Aggregates`
+`Sources -> Kafka -> (parallel) ClickHouse + S3`
+
+Recovery path:
+
+`Kafka/S3 -> Replay Service -> ClickHouse`
 
 ## 5) Core architecture principles
 
@@ -152,8 +162,6 @@ Required controls:
   - Parquet + compression (snappy/zstd)
 - Purpose:
   - Long-term retention, replay, backfills, model training, and audit
-- Ingestion anchor:
-  - ClickHouse consumes production event files from S3 via `S3Queue`
 
 ### 7.3 ClickHouse analytical and operational serving layer
 
@@ -168,7 +176,7 @@ Recommended modeling pattern:
 - Keep raw events immutable in MergeTree tables
 - Use materialized views for incremental projections/aggregates
 - Use replacing/versioned state models for late-arriving and out-of-order updates
-- Consume from S3-ready prefixes through `S3Queue` for consistency with archived source
+- Ingest in real-time from Kafka; use S3 for replay, repair, and historical backfills
 
 Representative example (illustrative):
 
@@ -204,11 +212,16 @@ PARTITION BY toYYYYMM(updated_at)
 ORDER BY (tenant_id, worker_id);
 ```
 
-### 7.4 Consistency model
+### 7.4 Consistency and failure-handling model
 
-- S3-anchored path (`Kafka -> S3 -> S3Queue -> ClickHouse`) is the default for stronger store-to-store consistency.
+- Parallel ingestion (`Kafka -> ClickHouse` and `Kafka -> S3`) is the default for low-latency operations and resilient fan-out.
 - Strict "always identical at all times" parity across stores is not guaranteed in distributed systems during transient failures; target bounded eventual consistency with freshness SLOs.
-- If optional fast-lane (`Kafka -> ClickHouse`) is enabled, require reconciliation jobs by tenant/time window and replay repair from S3.
+- Enforce robust ingestion controls:
+  - Global immutable `event_id` for idempotency
+  - Per-stage checkpoints/offset tracking
+  - DLQ and quarantine at each ingestion hop
+  - Reconciliation jobs by tenant/time window (`Kafka vs S3 vs ClickHouse`)
+  - Automated replay/repair service from Kafka/S3
 
 ## 8) Ontology and semantic layer
 
@@ -280,26 +293,36 @@ Guidelines:
 ## 12) Reliability and operability
 
 - Replay and backfill:
-  - Backfill from S3 lake into ClickHouse raw and projection layers
+  - Backfill from S3 lake or Kafka retention windows into ClickHouse raw and projection layers
 - Failure isolation:
-  - DLQ topics and idempotent consumers
+  - DLQ topics, quarantine paths, and idempotent consumers
 - Observability:
   - End-to-end lag, projection freshness, workflow trigger success, agent action outcomes
 
 ## 13) Key architecture decisions with provenance
 
-### Decision A: Kafka + S3 + S3Queue + ClickHouse as the operational data plane
+### Decision A: Parallel Kafka fan-out to ClickHouse and S3
 
-- What: Use MSK for event transport, S3 as archival and ingestion anchor, and ClickHouse (via S3Queue) for serving state and aggregates.
-- Why: Preserves replayable history and ensures ClickHouse only processes files already committed to S3.
+- What: Use MSK as system-of-record event log and fan out in parallel to ClickHouse (real-time serving) and S3 (archive/replay).
+- Why: Preserves low-latency operational behavior while retaining replayable durable history.
 - Category: derived
 - Confidence: high
 - Source:
-  - https://clickhouse.com/docs/engines/table-engines/integrations/s3queue
+  - https://clickhouse.com/docs/integrations/kafka/kafka-table-engine
   - https://clickhouse.com/docs/best-practices
-  - AWS MSK/S3 pipeline guidance
+  - PostHog ingestion architecture docs and handbook
 
-### Decision B: State projections via incremental materialized views
+### Decision B: Reliability control plane on top of parallel ingestion
+
+- What: Add idempotency, checkpoints, DLQs, reconciliation, and replay automation as first-class components.
+- Why: DLQ-only designs are insufficient for at-scale ingestion correctness and recovery.
+- Category: derived
+- Confidence: high
+- Source:
+  - https://clickhouse.com/docs/integrations/kafka/kafka-table-engine
+  - https://posthog.com/handbook/engineering/clickhouse/data-ingestion
+
+### Decision C: State projections via incremental materialized views
 
 - What: Build state and aggregate tables from immutable raw events.
 - Why: Optimizes query latency while preserving historical truth.
@@ -308,7 +331,7 @@ Guidelines:
 - Source:
   - https://clickhouse.com/docs/materialized-view/incremental-materialized-view
 
-### Decision C: Versioned upsert model for late-arriving events
+### Decision D: Versioned upsert model for late-arriving events
 
 - What: Use versioned state rows (for example, ReplacingMergeTree with `state_version`).
 - Why: Handles out-of-order updates without high-cost mutations.
@@ -318,15 +341,13 @@ Guidelines:
   - https://clickhouse.com/docs/en/guides/replacing-merge-tree
   - https://clickhouse.com/docs/best-practices
 
+### Decision E: Keep S3-anchored ingestion as optional compliance mode
 
-### Decision D: Keep direct Kafka -> ClickHouse as optional low-latency fallback
-
-- What: Maintain optional direct Kafka ingestion path for selected low-latency use cases.
-- Why: Enables faster path for strict real-time workflows while S3-anchored mode remains default.
+- What: Keep `Kafka -> S3 -> ClickHouse` as optional mode for specific compliance-driven workflows.
+- Why: Some workflows may prioritize archive-first consistency over latency.
 - Category: field
 - Confidence: heuristic
 - Source:
-  - https://clickhouse.com/docs/en/integrations/kafka
   - https://clickhouse.com/docs/engines/table-engines/integrations/s3queue
 
 ## 14) Open decisions
@@ -344,5 +365,3 @@ Guidelines:
 - Worker state projection reaches target freshness SLO
 - Rule/segment/workflow loop produces measurable reduction in stalled onboarding and compliance delays
 - Agent actions are policy-gated, auditable, and reversible
-
-
