@@ -479,3 +479,20 @@ Must-have monitors:
 - DLQ rate by error class
 - reconciliation mismatch rate
 - duplicate `event_id` rate
+
+
+## 8.7 Detailed pipeline loader configurations
+
+See detailed implementation-grade settings in:
+
+- `docs/pipeline-loader-configurations.md`
+
+Included there:
+
+- producer reliability settings (`acks=all`, idempotence, retry behavior)
+- Kafka topic and DLQ topology by failure class
+- Kafka->S3 sink config with DLQ routing
+- Kafka->ClickHouse loader config + ClickHouse ingest DLQ MV pattern
+- checkpoint schema and update cadence
+- reconciliation policy and replay worker configuration
+- quarantine metadata and operational alert thresholds

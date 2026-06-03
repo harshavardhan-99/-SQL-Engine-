@@ -46,3 +46,8 @@ flowchart LR
   ObsSec -.controls.-> Workflow
   ObsSec -.controls.-> Agents
 ```
+
+
+## Related implementation references
+
+- `docs/pipeline-loader-configurations.md`

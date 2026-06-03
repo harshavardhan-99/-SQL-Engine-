@@ -267,6 +267,23 @@ Repair and correctness profile:
 - Quarantine prefixes/topics for poison payloads
 - Retry with capped exponential backoff for transient failures
 
+## 7.2 Detailed pipeline loader configuration checklist
+
+Reference baseline:
+
+- `docs/pipeline-loader-configurations.md`
+
+Implementation checklist:
+
+1. Configure producer reliability (`acks=all`, idempotent producers, retry caps)
+2. Create primary topics + DLQ topics by failure class
+3. Configure Kafka->S3 sink with DLQ context headers enabled
+4. Configure Kafka->ClickHouse ingestion + ClickHouse ingest DLQ table/MV
+5. Deploy checkpoint store and stage-wise watermark updates
+6. Deploy reconciliation workers with mismatch thresholds by data criticality
+7. Deploy replay workers with idempotent `event_id` semantics
+8. Enable quarantine prefixes/topics and metadata retention policies
+
 ## 8) Observability and SLOs
 
 Track:

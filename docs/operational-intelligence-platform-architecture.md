@@ -223,6 +223,10 @@ ORDER BY (tenant_id, worker_id);
   - Reconciliation jobs by tenant/time window (`Kafka vs S3 vs ClickHouse`)
   - Automated replay/repair service from Kafka/S3
 
+Detailed loader settings:
+
+- `docs/pipeline-loader-configurations.md`
+
 ## 8) Ontology and semantic layer
 
 Entity model:

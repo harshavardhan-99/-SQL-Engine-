@@ -70,3 +70,24 @@ flowchart TB
 - Reconciliation completion per active window: <= 15 min
 - Replay trigger to repair completion: <= 30 min for standard windows
 - Post-repair mismatch rate: 0 for critical entities
+
+
+## Detailed pipeline loader configuration baseline
+
+Configuration source of truth:
+
+- `docs/pipeline-loader-configurations.md`
+
+Minimum enforced settings:
+
+- producer: `acks=all`, `enable.idempotence=true`
+- sink DLQ classes: producer validation, S3 sink, ClickHouse sink, transform, replay
+- checkpoint cadence: 5-15s
+- reconciliation cadence: 5-15m
+- replay strategy: Kafka-first then S3, idempotent by `event_id`
+
+DLQ routing policy:
+
+- transient failures: retry with capped exponential backoff
+- deterministic bad payloads: quarantine + DLQ + manual remediation
+- replay failures after retry cap: `dlq.replay.loader.v1`
