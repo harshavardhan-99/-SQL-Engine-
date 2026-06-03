@@ -261,3 +261,136 @@ Promotion gates:
 
 This is sufficient to deliver operational intelligence and automation for 30-40 GB/day while preserving replayability and future AI readiness.
 
+
+## 8) Managed ClickHouse processing + serving design (replicated MergeTree)
+
+This section defines the managed ClickHouse topology for both ingestion processing and low-latency serving.
+
+### 8.1 Cluster topology
+
+- Managed ClickHouse cluster
+- **2 shards x 2 replicas** minimum for production baseline
+- Dedicated role separation:
+  - **processing path:** Kafka ingestion + materialized view compute
+  - **serving path:** GraphQL/semantic API reads from distributed serving tables
+
+```mermaid
+flowchart LR
+  Kafka["MSK Kafka Topics"] --> Ingest["Ingestion Consumers"]
+
+  subgraph CH["Managed ClickHouse Cluster"]
+    subgraph S1["Shard 1"]
+      S1R1["Replica 1 - ReplicatedMergeTree"]
+      S1R2["Replica 2 - ReplicatedMergeTree"]
+    end
+    subgraph S2["Shard 2"]
+      S2R1["Replica 1 - ReplicatedMergeTree"]
+      S2R2["Replica 2 - ReplicatedMergeTree"]
+    end
+
+    DistRaw["Distributed: worker_events_all"]
+    DistState["Distributed: worker_state_all"]
+    DistAgg["Distributed: daily_worker_metrics_all"]
+  end
+
+  Ingest --> S1R1
+  Ingest --> S2R1
+  S1R1 --> DistRaw
+  S2R1 --> DistRaw
+  DistRaw --> DistState
+  DistRaw --> DistAgg
+
+  API["Semantic API / GraphQL"] --> DistState
+  API --> DistAgg
+```
+
+### 8.2 Table engine strategy
+
+- Local raw tables: `ReplicatedMergeTree`
+- Local state tables: `ReplicatedReplacingMergeTree(version)`
+- Local aggregates: `ReplicatedSummingMergeTree` or `ReplicatedAggregatingMergeTree` based on metric type
+- Serving tables: `Distributed` across all shards
+
+Why:
+
+- Replication provides HA and read availability during node failures.
+- MergeTree family gives efficient compression and time-range scans.
+- Distributed tables give a single logical endpoint for APIs and dashboards.
+
+### 8.3 Reference DDL pattern
+
+```sql
+-- Local raw events (on each replica)
+CREATE TABLE worker_events_local ON CLUSTER firstwork_cluster
+(
+  tenant_id LowCardinality(String),
+  worker_id String,
+  event_time DateTime64(3, 'UTC'),
+  event_type LowCardinality(String),
+  event_id UUID,
+  event_version UInt16,
+  payload_json String,
+  ingest_time DateTime64(3, 'UTC') DEFAULT now64()
+)
+ENGINE = ReplicatedMergeTree(
+  '/clickhouse/tables/{shard}/worker_events_local',
+  '{replica}'
+)
+PARTITION BY toYYYYMM(event_time)
+ORDER BY (tenant_id, worker_id, event_time, event_id);
+
+-- Global serving table across shards
+CREATE TABLE worker_events_all ON CLUSTER firstwork_cluster AS worker_events_local
+ENGINE = Distributed(
+  firstwork_cluster,
+  default,
+  worker_events_local,
+  cityHash64(tenant_id, worker_id)
+);
+
+-- Local state projection table (late-event safe)
+CREATE TABLE worker_state_local ON CLUSTER firstwork_cluster
+(
+  tenant_id LowCardinality(String),
+  worker_id String,
+  application_status LowCardinality(String),
+  verification_status LowCardinality(String),
+  compliance_status LowCardinality(String),
+  readiness_score UInt8,
+  state_version UInt64,
+  updated_at DateTime64(3, 'UTC')
+)
+ENGINE = ReplicatedReplacingMergeTree(
+  '/clickhouse/tables/{shard}/worker_state_local',
+  '{replica}',
+  state_version
+)
+PARTITION BY toYYYYMM(updated_at)
+ORDER BY (tenant_id, worker_id);
+
+CREATE TABLE worker_state_all ON CLUSTER firstwork_cluster AS worker_state_local
+ENGINE = Distributed(
+  firstwork_cluster,
+  default,
+  worker_state_local,
+  cityHash64(tenant_id, worker_id)
+);
+```
+
+### 8.4 Managed operations requirements
+
+- Multi-AZ replicas enabled
+- Automated backups + tested restore
+- Rolling upgrade policy with canary replica
+- Per-role users:
+  - `ingest_writer` (INSERT only on local ingest tables)
+  - `semantic_reader` (SELECT on distributed serving tables)
+  - `ops_admin` (restricted operational privileges)
+
+### 8.5 ClickHouse best-practice alignment
+
+- Per `schema-pk-plan-before-creation`: choose ORDER BY keys before launch.
+- Per `schema-pk-cardinality-order`: keep ORDER BY low -> high cardinality.
+- Per `schema-partition-low-cardinality` and `schema-partition-lifecycle`: use monthly partitions for lifecycle, not ad-hoc query acceleration.
+- Per `insert-mutation-avoid-update`: use replacing/versioned state patterns instead of frequent UPDATE mutations.
+- Per `query-mv-incremental`: build real-time aggregates through incremental materialized views.
